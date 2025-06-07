@@ -1,107 +1,147 @@
-class EmailService {
-  constructor() {
-    this.providers = [this.provider1, this.provider2];
-    this.statusMap = new Map();
-    this.sentEmails = new Set();
-    this.timestamps = [];
-    this.MAX_EMAILS = 3;
-    this.WINDOW_MS = 10000;
-  }
+const express = require('express');
+const bodyParser = require('body-parser');
+const request = require('supertest');
 
-  async provider1() {
-    throw new Error("Provider1 failed");
-  }
+// ------------------ Mock EmailService Implementation ------------------ //
+const app = express();
+app.use(bodyParser.json());
 
-  async provider2() {
-    return { success: true };
-  }
+const sentEmails = new Set();
+const emailStatusMap = new Map();
+const rateLimits = new Map();
 
-  isRateLimited() {
-    const now = Date.now();
-    this.timestamps = this.timestamps.filter(ts => now - ts < this.WINDOW_MS);
-    if (this.timestamps.length >= this.MAX_EMAILS) return true;
-    this.timestamps.push(now);
-    return false;
-  }
+const mockProviders = [
+  {
+    name: 'ProviderA',
+    send: jest.fn((email) => Promise.reject('Failed')), // always fail
+  },
+  {
+    name: 'ProviderB',
+    send: jest.fn((email) => Promise.resolve('Success')), // always succeed
+  },
+];
 
-  async retrySend(provider, email, retries = 3) {
-    for (let i = 0; i <= retries; i++) {
-      try {
-        return await provider(email);
-      } catch {
-        if (i === retries) throw new Error("Retries exhausted");
-        await new Promise(res => setTimeout(res, 2 ** i * 100));
-      }
+async function retry(fn, retries = 2, delay = 100) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      await new Promise(res => setTimeout(res, delay * Math.pow(2, i)));
     }
   }
-
-  async sendEmail(email) {
-    const { id } = email;
-    if (this.sentEmails.has(id)) return { status: "duplicate" };
-    if (this.isRateLimited()) return { status: "rate_limited" };
-
-    for (const provider of this.providers) {
-      try {
-        const result = await this.retrySend(provider.bind(this), email);
-        if (result.success) {
-          this.sentEmails.add(id);
-          this.statusMap.set(id, "sent");
-          return { status: "sent" };
-        }
-      } catch {}
-    }
-
-    this.statusMap.set(id, "failed");
-    return { status: "failed" };
-  }
-
-  getStatus(id) {
-    return this.statusMap.get(id) || "unknown";
-  }
+  throw lastErr;
 }
 
-// --------------------
-//  Jest Unit Tests
-// --------------------
+function rateLimit(ip, limit = 3, windowMs = 60000) {
+  const now = Date.now();
+  if (!rateLimits.has(ip)) rateLimits.set(ip, []);
+  const attempts = rateLimits.get(ip).filter(t => now - t < windowMs);
+  if (attempts.length >= limit) return false;
+  attempts.push(now);
+  rateLimits.set(ip, attempts);
+  return true;
+}
 
-describe("EmailService", () => {
-  let service;
+app.post('/send-email', async (req, res) => {
+  const ip = req.ip || 'local';
+  const { id, to, subject, body } = req.body;
 
+  if (!rateLimit(ip)) {
+    return res.status(429).json({ error: 'Rate limit exceeded' });
+  }
+
+  if (sentEmails.has(id)) {
+    return res.status(409).json({ error: 'Duplicate email' });
+  }
+
+  for (const provider of mockProviders) {
+    try {
+      const result = await retry(() => provider.send({ to, subject, body }));
+      sentEmails.add(id);
+      emailStatusMap.set(id, 'sent');
+      return res.status(200).json({ status: 'sent', provider: provider.name, message: result });
+    } catch (_) {}
+  }
+
+  emailStatusMap.set(id, 'failed');
+  return res.status(500).json({ status: 'failed' });
+});
+
+// ------------------ Tests ------------------ //
+
+describe('EmailService Tests', () => {
   beforeEach(() => {
-    service = new EmailService();
+    sentEmails.clear();
+    emailStatusMap.clear();
+    rateLimits.clear();
+    mockProviders[0].send.mockClear();
+    mockProviders[1].send.mockClear();
   });
 
-  test("should send email successfully via fallback", async () => {
-    const email = { id: "1", to: "a@b.com", subject: "Hi", body: "Hello" };
-    const result = await service.sendEmail(email);
-    expect(result.status).toBe("sent");
+  test('should send email using fallback provider', async () => {
+    const res = await request(app).post('/send-email').send({
+      id: 'email1',
+      to: 'a@example.com',
+      subject: 'Hello',
+      body: 'This is a test',
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.status).toBe('sent');
+    expect(res.body.provider).toBe('ProviderB');
   });
 
-  test("should prevent duplicate emails", async () => {
-    const email = { id: "2", to: "x@y.com", subject: "Test", body: "Body" };
-    await service.sendEmail(email);
-    const result = await service.sendEmail(email);
-    expect(result.status).toBe("duplicate");
+  test('should prevent duplicate email sending', async () => {
+    await request(app).post('/send-email').send({
+      id: 'email2',
+      to: 'a@example.com',
+      subject: 'Dup',
+      body: 'Body',
+    });
+
+    const res = await request(app).post('/send-email').send({
+      id: 'email2',
+      to: 'a@example.com',
+      subject: 'Dup',
+      body: 'Body',
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.error).toBe('Duplicate email');
   });
 
-  test("should enforce rate limiting", async () => {
-    const results = [];
-    for (let i = 0; i < 5; i++) {
-      const res = await service.sendEmail({
-        id: `email${i}`,
-        to: "user@example.com",
-        subject: "A",
-        body: "B",
+  test('should enforce rate limiting', async () => {
+    for (let i = 0; i < 3; i++) {
+      await request(app).post('/send-email').send({
+        id: `rate${i}`,
+        to: 'rate@example.com',
+        subject: 'Test',
+        body: 'Body',
       });
-      results.push(res.status);
     }
-    expect(results.includes("rate_limited")).toBe(true);
+
+    const res = await request(app).post('/send-email').send({
+      id: 'rate3',
+      to: 'rate@example.com',
+      subject: 'Test',
+      body: 'Body',
+    });
+
+    expect(res.statusCode).toBe(429);
+    expect(res.body.error).toBe('Rate limit exceeded');
   });
 
-  test("should track email status", async () => {
-    const email = { id: "track1", to: "abc@x.com", subject: "Track", body: "Me" };
-    await service.sendEmail(email);
-    const status = service.getStatus("track1");
-    expect(status).toBe("sent");
+  test('should track email status', async () => {
+    const id = 'status1';
+    await request(app).post('/send-email').send({
+      id,
+      to: 'track@example.com',
+      subject: 'Status',
+      body: 'Testing',
+    });
+
+    expect(emailStatusMap.get(id)).toBe('sent');
   });
 });
