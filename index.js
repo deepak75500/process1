@@ -158,7 +158,7 @@ app.get('/', (req, res) => {
   res.send('Email service running');
 });
 
-const PORT = 2999;
+const PORT = process.env.PORT || 2999;
 app.listen(PORT, () => {
   console.log(`Server started on http://localhost:${PORT}`);
 });
