@@ -1,0 +1,1 @@
+curl --ssl-no-revoke -X POST https://process1.onrender.com/send-email -H "Content-Type: application/json" -d "{\"id\":\"email1\",\"to\":\"test@example.com\",\"subject\":\"Hello\",\"body\":\"This is a test email\"}"
